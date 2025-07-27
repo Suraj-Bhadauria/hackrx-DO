@@ -7,20 +7,29 @@ from langchain.text_splitter import RecursiveCharacterTextSplitter
 def get_and_chunk_pdf(url: str) -> list[str]:
     print(f"Downloading document from {url}...")
     try:
-        response = requests.get(url, timeout=30)
-        response.raise_for_status()  
+        #  Use stream=True to avoid loading the whole file into memory at once
+        with requests.get(url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+
+            # create an in-memory bytes buffer
+            pdf_file_bytes = io.BytesIO()
+
+            # Download the file in chunks and write to the buffer
+            for chunk in r.iter_content(chunk_size=8192):
+                pdf_file_bytes.write(chunk)
+
+            # reset the buffer's position to the beginning for reading
+            pdf_file_bytes.seek(0)
+ 
     except requests.exceptions.RequestException as e:
         print(f"Error downloading PDF: {e}")
         raise
 
-    print("Successfully downloaded PDF. Extracting text with PyMuPDF...")
+    print("Successfully streamed PDF. Extracting text with PyMuPDF...")
     
-    # Read PDF content from the in-memory response content
     text=""
-    pdf_file = io.BytesIO(response.content)
-
-    # Use fitz to open the document
-    with fitz.open(stream=pdf_file, filetype="pdf") as doc:
+    # Use fitz to open the document from the in-memory bytes stream
+    with fitz.open(stream=pdf_file_bytes, filetype="pdf") as doc:
         for page in doc:
             text += page.get_text()
 

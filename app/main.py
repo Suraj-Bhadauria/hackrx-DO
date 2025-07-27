@@ -1,3 +1,5 @@
+# In app/main.py
+
 import hashlib
 import asyncio
 from fastapi import FastAPI, HTTPException, Depends
@@ -6,9 +8,8 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from . import config
 from .models import HackRxRequest, HackRxResponse
 from .document_processor import get_and_chunk_pdf
-# These imports now correctly point to your ChromaDB-powered vector_store functions
-from .vector_store import create_or_get_index, embed_and_store, retrieve_context_async
-from .llm_handler import generate_answer_async
+from .vector_store import create_or_get_index, embed_and_store, retrieve_context
+from .llm_handler import generate_all_answers_at_once_async
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
@@ -17,73 +18,81 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# --- CONFIGURATION ---
+# Define the size of our question batches. 3 is a safe number.
+QUESTION_BATCH_SIZE = 3
+
 # --- Security Dependency ---
 security_scheme = HTTPBearer()
 
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security_scheme)):
-    """A dependency to verify the bearer token."""
     if credentials.scheme != "Bearer" or credentials.credentials != config.API_BEARER_TOKEN:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or missing authorization token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise HTTPException(status_code=401, detail="Invalid or missing authorization token")
     return credentials
 
-# --- CONCURRENCY CONTROL ---
-CONCURRENCY_SEMAPHORE = asyncio.Semaphore(3)
-
-
-# --- Helper coroutine to process a single question ---
-# I've renamed 'index' to 'collection' for clarity
-async def process_single_question(question: str, collection) -> str:
-    """This function handles the full async pipeline for one question."""
-    async with CONCURRENCY_SEMAPHORE:
-        context = await retrieve_context_async(question, collection)
-        answer = await generate_answer_async(question, context)
-        print(f"Generated answer for: '{question}'")
-        return answer
-
-
-# --- API Endpoint ---
+# --- API Endpoint (FINAL BATCHED LOGIC) ---
 @app.post("/hackrx/run",
           response_model=HackRxResponse,
           dependencies=[Depends(verify_token)],
           tags=["Query Pipeline"])
 async def run_query_pipeline(request: HackRxRequest):
     """
-    This endpoint processes a document from a URL, stores its contents in a
-    vector database, and answers a list of questions concurrently.
+    This endpoint processes a document, stores it, and answers questions
+    using an optimized BATCHED strategy to respect API token limits.
     """
     try:
-        # 1. Create a unique name for the ChromaDB collection from the URL.
+        # 1. Get or Create ChromaDB Collection for caching
         url_str = str(request.documents)
         collection_name = f"hackrx-{hashlib.md5(url_str.encode()).hexdigest()}"
-        
-        # 2. Get or Create ChromaDB Collection (this is now instant)
-        # Renamed 'index' to 'collection'
         collection = create_or_get_index(collection_name)
 
-        # 3. **CRITICAL FIX**: Check if the collection is empty using ChromaDB's .count() method.
+        # 2. Process document if it's new
         if collection.count() == 0:
             print("Collection is new or empty. Processing document...")
             chunks = get_and_chunk_pdf(url_str)
             if not chunks:
                  raise HTTPException(status_code=400, detail="Failed to extract text from the document.")
-            # This step is synchronous and happens only for new documents
-            embed_and_store(chunks, collection)
+            
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, embed_and_store, chunks, collection)
+            print("Document processing and storage complete.")
         else:
             print("Document already processed. Using existing collection.")
 
-        # 4. Process all questions concurrently
-        tasks = [process_single_question(q, collection) for q in request.questions]
+        # --- BATCHING LOGIC STARTS HERE ---
+        all_final_answers = []
+        question_list = request.questions
         
-        print("Starting concurrent generation of all answers...")
-        final_answers = await asyncio.gather(*tasks)
-        print("All answers generated.")
+        # Create batches of questions, e.g., [[q1,q2,q3], [q4,q5,q6], ...]
+        question_batches = [
+            question_list[i:i + QUESTION_BATCH_SIZE]
+            for i in range(0, len(question_list), QUESTION_BATCH_SIZE)
+        ]
 
-        # 5. Return the structured JSON response
-        return HackRxResponse(answers=final_answers)
+        print(f"Split {len(question_list)} questions into {len(question_batches)} batches of size {QUESTION_BATCH_SIZE}.")
+
+        # Process each batch
+        for i, batch in enumerate(question_batches):
+            print(f"Processing Batch {i+1}/{len(question_batches)}...")
+            
+            # 3. Gather context for the CURRENT BATCH of questions
+            batch_context_chunks = set()
+            for q in batch:
+                context_for_question = retrieve_context(q, collection)
+                batch_context_chunks.add(context_for_question)
+            
+            final_batch_context = " ".join(batch_context_chunks)
+
+            # 4. Make one API call PER BATCH
+            batch_answers = await generate_all_answers_at_once_async(batch, final_batch_context)
+            
+            # Add the answers from this batch to our final list
+            all_final_answers.extend(batch_answers)
+            print(f"Batch {i+1} complete.")
+
+        # --- BATCHING LOGIC ENDS HERE ---
+
+        return HackRxResponse(answers=all_final_answers)
 
     except HTTPException as e:
         raise e
@@ -93,5 +102,4 @@ async def run_query_pipeline(request: HackRxRequest):
 
 @app.get("/", tags=["Health Check"])
 def read_root():
-    """A simple health check endpoint."""
     return {"status": "ok", "message": "Welcome to the HackRx Query System!"}
