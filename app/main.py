@@ -2,6 +2,7 @@
 
 import hashlib
 import asyncio
+import itertools
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
@@ -9,7 +10,8 @@ from . import config
 from .models import HackRxRequest, HackRxResponse
 from .document_processor import get_and_chunk_pdf
 from .vector_store import create_or_get_index, embed_and_store, retrieve_context
-from .llm_handler import generate_all_answers_at_once_async
+# Import the new, simpler handler
+from .llm_handler import generate_answer_async
 
 # --- FastAPI App Initialization ---
 app = FastAPI(
@@ -18,8 +20,12 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# --- CONFIGURATION ---
-QUESTION_BATCH_SIZE = 3
+# --- CONCURRENCY CONTROL ---
+# This semaphore controls how many concurrent API calls we make to Groq.
+# A good starting point is 2-3 calls per available API key.
+# With 4 keys, a limit of 8-10 is safe and very fast.
+API_CONCURRENCY_LIMIT = 8
+API_SEMAPHORE = asyncio.Semaphore(API_CONCURRENCY_LIMIT)
 
 # --- Security Dependency ---
 security_scheme = HTTPBearer()
@@ -29,50 +35,43 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security_sc
         raise HTTPException(status_code=401, detail="Invalid or missing authorization token")
     return credentials
 
-# --- Helper Coroutine for a Single Batch ---
-async def process_question_batch(batch: list[str], collection) -> list[str]:
+# --- Helper Coroutine for a SINGLE Question (The most reliable method) ---
+async def process_single_question(question: str, collection, api_key: str) -> str:
     """
-    This function handles the logic for one batch of questions:
-    1. Gathers context for the batch.
-    2. Makes a single API call to the LLM.
+    This function handles the full, high-accuracy pipeline for one question.
     """
-    print(f"Processing batch with {len(batch)} questions...")
+    # We still retrieve context first
+    loop = asyncio.get_running_loop()
+    context = await loop.run_in_executor(
+        None, retrieve_context, question, collection
+    )
     
-    # Gather context for the CURRENT BATCH of questions
-    batch_context_chunks = set()
-    for q in batch:
-        # retrieve_context is synchronous, so we run it in an executor
-        # to avoid blocking the main async loop while others run.
-        loop = asyncio.get_running_loop()
-        context_for_question = await loop.run_in_executor(
-            None, retrieve_context, q, collection
-        )
-        batch_context_chunks.add(context_for_question)
+    # We then wrap the single, simple API call in our semaphore
+    async with API_SEMAPHORE:
+        answer = await generate_answer_async(question, context, api_key)
     
-    final_batch_context = " ".join(batch_context_chunks)
+    print(f"Generated answer for: '{question[:50]}...'")
+    return answer
 
-    # Make one API call PER BATCH
-    batch_answers = await generate_all_answers_at_once_async(batch, final_batch_context)
-    print(f"Finished batch with {len(batch)} questions.")
-    return batch_answers
-
-# --- API Endpoint (FINAL CONCURRENT BATCHED LOGIC) ---
+# --- API Endpoint ---
 @app.post("/hackrx/run",
           response_model=HackRxResponse,
           dependencies=[Depends(verify_token)],
           tags=["Query Pipeline"])
 async def run_query_pipeline(request: HackRxRequest):
     """
-    This endpoint processes a document and answers questions using a
-    CONCURRENT BATCHED strategy for maximum throughput.
+    This endpoint uses the final, most robust architecture: concurrent processing
+    of single questions, each with a simple prompt, controlled by a semaphore.
     """
+    api_keys = config.GROQ_API_KEYS
+    if not api_keys:
+        raise HTTPException(status_code=500, detail="No Groq API keys configured on the server.")
+
     try:
-        # 1. Get or Create ChromaDB Collection
         url_str = str(request.documents)
         collection_name = f"hackrx-{hashlib.md5(url_str.encode()).hexdigest()}"
         collection = create_or_get_index(collection_name)
 
-        # 2. Process document if it's new (The "expensive" first run)
         if collection.count() == 0:
             print("Collection is new or empty. Processing document...")
             chunks = get_and_chunk_pdf(url_str)
@@ -83,40 +82,24 @@ async def run_query_pipeline(request: HackRxRequest):
             await loop.run_in_executor(None, embed_and_store, chunks, collection)
             print("Document processing and storage complete.")
         else:
-            # This case won't happen in the hackathon testing, but is good practice.
             print("Document already processed. Using existing collection.")
 
-        # --- CONCURRENT BATCHING LOGIC STARTS HERE ---
-        question_list = request.questions
+        # --- High-Accuracy Concurrent Processing ---
+        questions = request.questions
         
-        # Create batches of questions
-        question_batches = [
-            question_list[i:i + QUESTION_BATCH_SIZE]
-            for i in range(0, len(question_list), QUESTION_BATCH_SIZE)
+        # This cycles through your list of API keys for each question
+        key_cycler = itertools.cycle(api_keys)
+
+        # Create a list of tasks, one for each question
+        tasks = [
+            process_single_question(q, collection, next(key_cycler))
+            for q in questions
         ]
 
-        print(f"Split {len(question_list)} questions into {len(question_batches)} batches to run concurrently.")
-
-        # Create a list of tasks, one for each batch
-        tasks = [process_question_batch(batch, collection) for batch in question_batches]
+        print(f"Starting concurrent generation of {len(tasks)} answers...")
+        all_final_answers = await asyncio.gather(*tasks)
+        print("All answers generated.")
         
-        # Run all batch tasks concurrently
-        print("Starting concurrent processing of all batches...")
-        results_from_batches = await asyncio.gather(*tasks)
-        print("All batches have completed.")
-        
-        # The answers will be in a list of lists, so we need to flatten it
-        # while preserving the original order of the questions.
-        # We can do this by creating a map of question to answer.
-        answer_map = {}
-        for batch, answer_batch in zip(question_batches, results_from_batches):
-            for question, answer in zip(batch, answer_batch):
-                answer_map[question] = answer
-
-        # Reconstruct the final answer list in the original order
-        all_final_answers = [answer_map[q] for q in question_list]
-        # --- CONCURRENT BATCHING LOGIC ENDS HERE ---
-
         return HackRxResponse(answers=all_final_answers)
 
     except HTTPException as e:
