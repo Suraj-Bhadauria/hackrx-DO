@@ -28,8 +28,6 @@ GROQ_API_KEYS = [key for key in GROQ_API_KEYS if key]
 # PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT")
 
 
-
-
 # hardcoded bearer token
 API_BEARER_TOKEN = "52399ce2b5dde000da221a0495f36cad39a5a362c2c823aa31268d6b5ad18c76"
 
