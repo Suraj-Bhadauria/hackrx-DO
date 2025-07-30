@@ -6,4 +6,6 @@ __pycache__/
 *.pyd
 *.sqlite3
 .DS_Store
-info.txt
+info.txtt
+test.py
+test_venv

@@ -1,0 +1,21 @@
+version 4
+will try FAISS(Local indexing) here to reduce the 
+index creation time
+- FAISS will not store the embeddings, instead process it in run time 
+- lets try
+
+- ai studio told that chromaDB which I am currently using 
+is also in-time so no major difference will come even if
+I setup in time FAISS
+
+- but it has suggested to shift back to sentence-transformers from google api 
+- strange!
+
+-- and yes its working well now I will put it to digital ocean
+
+- but lets see
+
+
+-- I have made account on digital ocean and has bought a linux box using github education pack free credits
+-- Now onwards I wont make different version folders, instead work on a single folder using git
+-- Now everything is working cool, all I need to do is prompt engineering

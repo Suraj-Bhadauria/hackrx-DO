@@ -32,7 +32,7 @@ GROQ_API_KEYS = [key for key in GROQ_API_KEYS if key]
 API_BEARER_TOKEN = "52399ce2b5dde000da221a0495f36cad39a5a362c2c823aa31268d6b5ad18c76"
 
 # --- Model and Search Configuration ---
-EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
+EMBEDDING_MODEL = 'BAAI/bge-small-en-v1.5'
 LLM_MODEL = 'llama3-8b-8192'
 PINECONE_INDEX_METRIC = 'cosine'
 TOP_K_RESULTS = 5
