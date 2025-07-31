@@ -9,3 +9,4 @@ __pycache__/
 info.txtt
 test.py
 test_venv
+.env.template
